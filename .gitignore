@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Databricks / Spark
+.spark/
+.databricks/
+
+# Local data files
+*.csv
+*.parquet
+*.json
+*.xlsx
+*.xls
+
+# Credentials and secrets
+.env
+*.pem
+*.key
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
