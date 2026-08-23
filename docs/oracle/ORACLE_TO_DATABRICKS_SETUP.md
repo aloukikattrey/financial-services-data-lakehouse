@@ -1,5 +1,7 @@
 # Oracle to Azure Databricks Connectivity Setup
 
+## Purpose
+
 This document records the development setup used to connect the local synthetic Oracle operational source to Azure Databricks. The local Oracle database is used only as synthetic project data; no employer/client data or credentials are stored in the repository.
 
 ## 1. Azure Databricks Foundation
@@ -161,8 +163,6 @@ Docker port 1521
 Oracle listener
 ```
 
-At this point, TCP connectivity is validated. Oracle JDBC configuration is the next step.
-
 ## 7. Unity Catalog Volume for JDBC Driver
 
 A project schema was created:
@@ -185,56 +185,104 @@ The resulting path is:
 
 The volume creation originally failed because the metastore did not have a root storage credential. After assigning `aloukik_creds` as the metastore root credential, the volume creation completed successfully.
 
-## 8. Next JDBC Step
+The Oracle JDBC driver `ojdbc11.jar` was uploaded to the managed volume.
 
-The next implementation step is to obtain the Oracle JDBC driver `ojdbc11.jar` from Oracle and upload it to:
+## 8. Oracle Foreign Connection and Federation
 
-```text
-/Volumes/databricks-cata/finance/jdbc_drivers/
-```
+A Databricks Oracle connection was created using the temporary tunnel endpoint and the Oracle `FINANCE_APP` credentials. Credentials are not stored in this repository.
 
-The Oracle service to target is:
+The Oracle service name used for the foreign connection/catalog is:
 
 ```text
 FREEPDB1
 ```
 
-The JDBC URL will use the temporary tunnel host and port rather than `localhost`:
+The resulting foreign catalog is:
 
 ```text
-jdbc:oracle:thin:@//<temporary-tunnel-host>:<temporary-tunnel-port>/FREEPDB1
+oracle_finance_source_catalog
 ```
 
-The Oracle application user is:
+The catalog was configured through the Lakehouse Federation Oracle workflow. Access was restricted to the project owner for this development environment, and the catalog metadata comment identifies it as a read-only connection to the synthetic Oracle source.
+
+The foreign catalog successfully exposed the Oracle source schema and tables in Databricks. Verified source objects include:
 
 ```text
-FINANCE_APP
+oracle_finance_source_catalog
+└── FINANCE_APP
+    ├── CLIENT
+    ├── ACCOUNT
+    ├── PORTFOLIO
+    ├── SECURITY
+    ├── HOLDINGS
+    └── TRN_TRANSACTIONS
 ```
 
-The password must be entered directly into the Databricks connection configuration and must never be committed to GitHub.
+The data was verified as visible and queryable from Databricks, confirming the end-to-end federation path.
 
-## 9. Current Connectivity Milestone
+Example catalog query pattern:
 
-Completed:
+```sql
+SELECT *
+FROM oracle_finance_source_catalog.finance_app.CLIENT
+LIMIT 10;
+```
 
-- [x] Azure Databricks workspace
-- [x] Unity Catalog metastore
-- [x] Access Connector
-- [x] Azure managed-identity storage credential
-- [x] Metastore root storage credential assignment
-- [x] `databricks-cata` catalog
-- [x] `finance` schema
-- [x] `jdbc_drivers` managed volume
-- [x] Local Oracle Database Free
-- [x] Oracle `FINANCE_APP` schema and financial source tables
-- [x] Local Oracle listener verification
-- [x] Temporary TCP tunnel
-- [x] Databricks-to-Oracle TCP connectivity test
+## 9. End-to-End Connectivity Milestone
 
-Next:
+The completed development path is now:
 
-- [ ] Upload `ojdbc11.jar`
-- [ ] Create Oracle JDBC connection in Databricks
-- [ ] Test JDBC authentication
-- [ ] Query `FINANCE_APP.CLIENT` from Databricks
+```text
+Local Oracle Database
+        │
+        │ TCP :1521
+        ▼
+  Pinggy TCP Tunnel
+        │
+        ▼
+ Azure Databricks
+        │
+        ▼
+ Oracle Connection
+        │
+        ▼
+ Oracle Foreign Catalog
+        │
+        ▼
+oracle_finance_source_catalog
+        │
+        ▼
+    FINANCE_APP
+        │
+        ├── CLIENT
+        ├── ACCOUNT
+        ├── PORTFOLIO
+        ├── SECURITY
+        ├── HOLDINGS
+        └── TRN_TRANSACTIONS
+```
+
+This proves that the synthetic Oracle source can be reached from Azure Databricks and exposed through Unity Catalog as a federated read-only data source.
+
+## 10. Next Phase — Oracle to Bronze
+
+Federation is the source-access layer. The next step is to materialize the required Oracle datasets into the Lakehouse Bronze layer rather than treating the foreign catalog as the final data platform.
+
+Planned work:
+
+- [x] Upload `ojdbc11.jar`
+- [x] Create Oracle connection in Databricks
+- [x] Create Oracle foreign catalog
+- [x] Verify Oracle schemas/tables are visible
+- [x] Verify source data is queryable from Databricks
+- [ ] Decide batch JDBC vs incremental extraction pattern
 - [ ] Implement Oracle-to-Bronze ingestion
+- [ ] Create Bronze Delta tables
+- [ ] Add ingestion metadata
+- [ ] Implement incremental extraction strategy
+- [ ] Test repeatable loads
+- [ ] Add data-quality checks for Bronze ingestion
+
+### Architecture note
+
+The temporary Pinggy tunnel is a development-only networking solution. It is not the intended production architecture. A production implementation would use private connectivity between the Oracle environment and Azure/Databricks, such as VPN or ExpressRoute, depending on the deployment model.
