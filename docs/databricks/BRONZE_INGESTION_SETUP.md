@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document records the initial Bronze-layer implementation after establishing Oracle-to-Azure Databricks connectivity. The Oracle source is accessed through the read-only foreign catalog and materialized into Unity Catalog-managed Delta tables for downstream Silver and Gold processing.
+This document records the Bronze-layer implementation after establishing Oracle-to-Azure Databricks connectivity. The Oracle source is accessed through the read-only foreign catalog and materialized into Unity Catalog-managed Delta tables for downstream Silver and Gold processing.
 
 ## 1. Source Layer
 
@@ -55,7 +55,7 @@ AS
 SELECT ...;
 ```
 
-Delta is useful here because the downstream pipeline will need reliable table transactions, schema management, repeatable writes, and incremental processing. Delta also provides table history/time-travel capabilities and efficient support for operations such as `MERGE`, which will become relevant when the project moves from full loads to incremental ingestion for `HOLDINGS` and `TRN_TRANSACTIONS`.
+Delta is useful here because the downstream pipeline will need reliable table transactions, schema management, repeatable writes, and incremental processing. Delta also provides table history/time-travel capabilities and efficient support for operations such as `MERGE`, which becomes relevant when the project moves from full loads to incremental ingestion for changing datasets.
 
 This is an architectural choice rather than syntax used only because it is common in Databricks tutorials: the Bronze layer is intended to become a durable, replayable input to Silver, so a transactional table format is appropriate.
 
@@ -141,7 +141,164 @@ This does **not** mean every production financial pipeline should use full loads
 
 The distinction demonstrates an important data-engineering principle: ingestion strategy should be chosen based on source-table characteristics, change volume, business requirements, and recovery/reprocessing needs rather than applying one pattern universally.
 
-## 9. Ingestion Metadata and Operational Context
+## 9. Holdings: Source Analysis Before Incremental Ingestion
+
+Before creating the Bronze `HOLDINGS` table, the source schema was inspected rather than assuming that a generic timestamp watermark would work.
+
+The relevant Oracle columns are:
+
+```text
+HOLDING_ID
+PORTFOLIO_ID
+SECURITY_ID
+AS_OF_DATE
+QUANTITY
+UNIT_PRICE
+MARKET_VALUE
+COST_BASIS
+CURRENCY_CODE
+CREATED_AT
+UPDATED_AT
+```
+
+Two source characteristics were then validated:
+
+1. `HOLDING_ID` is globally unique in the current source dataset.
+2. `UPDATED_AT` is not a useful incremental watermark in the synthetic source because all currently generated rows share the same timestamp.
+
+The source is instead structured as periodic holdings snapshots. The observed snapshot dates were:
+
+```text
+2026-06-30    480 rows
+2026-07-31    480 rows
+2026-08-21    480 rows
+```
+
+### Incremental design decision
+
+For this project, `AS_OF_DATE` is used as the incremental boundary for `HOLDINGS`, under the documented business assumption that **completed holdings snapshots are immutable and new snapshots are added with newer `AS_OF_DATE` values**.
+
+This is a snapshot-ingestion pattern, not a generic CDC pattern.
+
+Conceptually:
+
+```text
+Bronze MAX(AS_OF_DATE)
+        ↓
+Oracle WHERE AS_OF_DATE > watermark
+        ↓
+New snapshot rows
+        ↓
+Append to Bronze Delta
+```
+
+The design is logical for an immutable periodic snapshot source. It would **not** be sufficient if historical snapshots could be corrected after loading; such a production source would require a reliable change timestamp, reconciliation process, or CDC mechanism.
+
+## 10. Initial Holdings Bronze Load
+
+The initial Bronze snapshot was materialized with the same source-preserving pattern:
+
+```sql
+CREATE TABLE `databricks-cata`.bronze.holdings
+USING DELTA
+AS
+SELECT
+    *,
+    current_timestamp() AS ingestion_timestamp,
+    'ORACLE' AS source_system,
+    'FINANCE_APP.HOLDINGS' AS source_table
+FROM oracle_finance_source_catalog.finance_app.HOLDINGS;
+```
+
+The initial Bronze table contained:
+
+```text
+2026-06-30    480
+2026-07-31    480
+2026-08-21    480
+-------------------
+             1440 rows
+```
+
+## 11. Holdings Incremental Load Test
+
+To prove the incremental pattern, a controlled synthetic source snapshot for `2026-08-22` was added to Oracle. The new snapshot contained 480 rows.
+
+The Bronze watermark before the test was:
+
+```text
+MAX(AS_OF_DATE) = 2026-08-21
+```
+
+The incremental query was:
+
+```sql
+SELECT
+    AS_OF_DATE,
+    COUNT(*) AS record_count
+FROM oracle_finance_source_catalog.finance_app.HOLDINGS
+WHERE AS_OF_DATE >
+      (
+          SELECT MAX(AS_OF_DATE)
+          FROM `databricks-cata`.bronze.holdings
+      )
+GROUP BY AS_OF_DATE
+ORDER BY AS_OF_DATE;
+```
+
+The query returned exactly:
+
+```text
+2026-08-22    480
+```
+
+The new snapshot was then appended to Bronze:
+
+```sql
+INSERT INTO `databricks-cata`.bronze.holdings
+SELECT
+    *,
+    current_timestamp() AS ingestion_timestamp,
+    'ORACLE' AS source_system,
+    'FINANCE_APP.HOLDINGS' AS source_table
+FROM oracle_finance_source_catalog.finance_app.HOLDINGS
+WHERE AS_OF_DATE >
+      (
+          SELECT MAX(AS_OF_DATE)
+          FROM `databricks-cata`.bronze.holdings
+      );
+```
+
+After ingestion, Bronze contained:
+
+```text
+2026-06-30    480
+2026-07-31    480
+2026-08-21    480
+2026-08-22    480
+-------------------
+             1920 rows
+```
+
+A second execution of the same incremental extraction found no new records because the Bronze watermark had advanced to `2026-08-22`. This demonstrated snapshot-level idempotent behavior: rerunning the load did not duplicate the already-ingested snapshot.
+
+### Why this matters
+
+This test demonstrates several core data-engineering concepts rather than just copying a table:
+
+- **Watermarking** — the latest loaded `AS_OF_DATE` controls the next extraction boundary.
+- **Incremental ingestion** — only new snapshots are read after the initial load.
+- **Append semantics** — immutable snapshots can be appended instead of rewritten.
+- **Idempotent reruns at the snapshot level** — a second run with no newer snapshot adds no rows.
+- **Source-specific design** — the ingestion strategy is based on how the source data behaves rather than applying one generic pattern to every table.
+
+## 12. Why `UPDATED_AT` Was Not Used
+
+In a production system, `UPDATED_AT` would often be a strong candidate for incremental extraction. In the current synthetic source, however, `UPDATED_AT` is identical across all generated holdings records, so it cannot reliably distinguish newly changed records.
+
+Rather than manufacturing a false change-data-capture story, the project uses the source's actual snapshot behavior and explicitly documents the assumption behind `AS_OF_DATE` watermarking.
+
+## 13. Ingestion Metadata and Operational Context
 
 The Bronze tables retain source-level columns and add technical metadata:
 
@@ -151,42 +308,27 @@ The Bronze tables retain source-level columns and add technical metadata:
 
 These fields are intentionally technical rather than business attributes. They create a basic audit trail and make troubleshooting easier without moving business transformations into Bronze.
 
-## 10. Validation
+## 14. Validation
 
-Row counts were compared between the foreign Oracle source and each Bronze table.
+Row counts were compared between the foreign Oracle source and the Bronze tables.
 
-Example source validation:
+For example:
 
 ```sql
 SELECT COUNT(*)
 FROM oracle_finance_source_catalog.finance_app.account;
 ```
 
-Example Bronze validation:
-
 ```sql
 SELECT COUNT(*)
 FROM `databricks-cata`.bronze.account;
 ```
 
-The same comparison was performed for `CLIENT`, `PORTFOLIO`, and `SECURITY`, and the Bronze data was verified successfully.
+For holdings, snapshot counts and the incremental watermark were validated before and after ingestion.
 
-Ingestion metadata can be validated with:
+The Bronze data was verified successfully for the completed tables and the incremental `HOLDINGS` test.
 
-```sql
-SELECT
-    source_system,
-    source_table,
-    ingestion_timestamp,
-    COUNT(*) AS record_count
-FROM `databricks-cata`.bronze.security
-GROUP BY
-    source_system,
-    source_table,
-    ingestion_timestamp;
-```
-
-## 11. Design Decisions
+## 15. Design Decisions
 
 ### Preserve source-level data in Bronze
 
@@ -202,23 +344,42 @@ Delta gives the Bronze layer a durable table abstraction suitable for repeatable
 
 ### Different tables can use different ingestion strategies
 
-Small reference-oriented tables can start with full snapshots, while larger operational datasets can use incremental extraction. The project will demonstrate both patterns rather than forcing every source table into the same ingestion design.
+Small reference-oriented tables can start with full snapshots, while larger operational datasets can use incremental extraction. The project demonstrates both patterns rather than forcing every source table into the same ingestion design.
 
-## 12. Next Work
+### Document source assumptions explicitly
+
+For `HOLDINGS`, `AS_OF_DATE` watermarking is valid only under the assumption that completed snapshots are immutable. If the production source permits historical corrections, the ingestion design must change to detect and reconcile those changes.
+
+## 16. Current Progress
+
+```text
+CLIENT              ✓ Bronze full load
+ACCOUNT             ✓ Bronze full load
+PORTFOLIO           ✓ Bronze full load
+SECURITY            ✓ Bronze full load
+HOLDINGS            ✓ Bronze initial load
+HOLDINGS incremental ✓ New snapshot detected and appended
+                      ✓ Second-run no-new-data test passed
+TRN_TRANSACTIONS    pending
+```
+
+## 17. Next Work
 
 - [x] Materialize `CLIENT` into Bronze
 - [x] Materialize `ACCOUNT` into Bronze
 - [x] Materialize `PORTFOLIO` into Bronze
 - [x] Materialize `SECURITY` into Bronze
-- [ ] Materialize `HOLDINGS` into Bronze
+- [x] Materialize `HOLDINGS` into Bronze
+- [x] Validate `HOLDINGS` incremental watermark
+- [x] Test new-snapshot ingestion
+- [x] Test second-run/no-duplicate behavior
+- [ ] Inspect `TRN_TRANSACTIONS` source change columns
+- [ ] Design transaction-specific incremental ingestion
 - [ ] Materialize `TRN_TRANSACTIONS` into Bronze
-- [ ] Decide full-load versus incremental strategy by table
 - [ ] Add deterministic ingestion/load identifiers where required
 - [ ] Add Bronze data-quality checks
 - [ ] Build Databricks Workflow orchestration
 
-The expected strategy is to treat `HOLDINGS` and `TRN_TRANSACTIONS` differently from the smaller reference-oriented datasets. Before creating those Bronze tables, the project will inspect their date/change columns and design the incremental extraction pattern deliberately.
-
-## 13. Important Connectivity Note
+## 18. Important Connectivity Note
 
 The current Oracle connection uses a temporary Pinggy TCP tunnel for development. The tunnel is not a production architecture and must remain active while the Oracle foreign catalog is queried. A production implementation would use private connectivity such as VPN or ExpressRoute between the Oracle environment and Azure/Databricks.
