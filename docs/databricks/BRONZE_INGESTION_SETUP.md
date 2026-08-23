@@ -97,45 +97,79 @@ FROM oracle_finance_source_catalog.finance_app.ACCOUNT;
 
 The `ACCOUNT` table is a small reference/master-style source table, so a full initial materialization is appropriate. Later orchestration can replace or extend this with a repeatable load strategy if the source requirements change.
 
-### Why add ingestion metadata?
+## 6. Portfolio Bronze Ingestion
 
-The metadata columns are intentionally not business attributes from Oracle. They allow the Lakehouse to answer operational questions such as:
-
-- Which source system produced this row?
-- Which source object was ingested?
-- When was this Bronze load performed?
-
-This separation keeps source data recognizable while giving downstream engineering and troubleshooting logic a basic audit trail.
-
-## 6. Validation
-
-Row counts were compared between the foreign Oracle source and the Bronze tables.
-
-For `CLIENT`:
+The `PORTFOLIO` source table was materialized into a managed Delta Bronze table using the same source-preserving pattern:
 
 ```sql
-SELECT COUNT(*)
-FROM oracle_finance_source_catalog.finance_app.client;
+CREATE TABLE `databricks-cata`.bronze.portfolio
+USING DELTA
+AS
+SELECT
+    *,
+    current_timestamp() AS ingestion_timestamp,
+    'ORACLE' AS source_system,
+    'FINANCE_APP.PORTFOLIO' AS source_table
+FROM oracle_finance_source_catalog.finance_app.portfolio;
 ```
+
+`PORTFOLIO` is treated as a relatively small reference/master-style dataset for the initial implementation, so a full snapshot load is appropriate.
+
+## 7. Security Bronze Ingestion
+
+The `SECURITY` source table was also materialized into a managed Delta Bronze table:
 
 ```sql
-SELECT COUNT(*)
-FROM `databricks-cata`.bronze.client;
+CREATE TABLE `databricks-cata`.bronze.security
+USING DELTA
+AS
+SELECT
+    *,
+    current_timestamp() AS ingestion_timestamp,
+    'ORACLE' AS source_system,
+    'FINANCE_APP.SECURITY' AS source_table
+FROM oracle_finance_source_catalog.finance_app.security;
 ```
 
-For `ACCOUNT`:
+The security master is similarly treated as a reference/master-style source for the first version of the pipeline. A later version can introduce a source-specific refresh strategy if security attributes become slowly changing.
+
+## 8. Why the Initial Reference Tables Use Full Loads
+
+`CLIENT`, `ACCOUNT`, `PORTFOLIO`, and `SECURITY` are relatively small compared with the transactional tables in this project. For the first Bronze implementation, full materialization keeps the ingestion logic simple while establishing the source-to-Delta pattern.
+
+This does **not** mean every production financial pipeline should use full loads. The project intentionally reserves incremental processing for the larger, more frequently changing datasets, especially `HOLDINGS` and `TRN_TRANSACTIONS`.
+
+The distinction demonstrates an important data-engineering principle: ingestion strategy should be chosen based on source-table characteristics, change volume, business requirements, and recovery/reprocessing needs rather than applying one pattern universally.
+
+## 9. Ingestion Metadata and Operational Context
+
+The Bronze tables retain source-level columns and add technical metadata:
+
+- `ingestion_timestamp` — when the row was materialized into Bronze.
+- `source_system` — identifies the originating platform (`ORACLE`).
+- `source_table` — identifies the originating Oracle object.
+
+These fields are intentionally technical rather than business attributes. They create a basic audit trail and make troubleshooting easier without moving business transformations into Bronze.
+
+## 10. Validation
+
+Row counts were compared between the foreign Oracle source and each Bronze table.
+
+Example source validation:
 
 ```sql
 SELECT COUNT(*)
 FROM oracle_finance_source_catalog.finance_app.account;
 ```
 
+Example Bronze validation:
+
 ```sql
 SELECT COUNT(*)
 FROM `databricks-cata`.bronze.account;
 ```
 
-The Bronze data was verified successfully and the source rows were visible in the Delta tables.
+The same comparison was performed for `CLIENT`, `PORTFOLIO`, and `SECURITY`, and the Bronze data was verified successfully.
 
 Ingestion metadata can be validated with:
 
@@ -145,14 +179,14 @@ SELECT
     source_table,
     ingestion_timestamp,
     COUNT(*) AS record_count
-FROM `databricks-cata`.bronze.account
+FROM `databricks-cata`.bronze.security
 GROUP BY
     source_system,
     source_table,
     ingestion_timestamp;
 ```
 
-## 7. Design Decisions
+## 11. Design Decisions
 
 ### Preserve source-level data in Bronze
 
@@ -166,12 +200,16 @@ Delta gives the Bronze layer a durable table abstraction suitable for repeatable
 
 `ingestion_timestamp`, `source_system`, and `source_table` are technical/audit metadata. Business cleansing, enrichment, and conformance remain Silver responsibilities.
 
-## 8. Next Work
+### Different tables can use different ingestion strategies
+
+Small reference-oriented tables can start with full snapshots, while larger operational datasets can use incremental extraction. The project will demonstrate both patterns rather than forcing every source table into the same ingestion design.
+
+## 12. Next Work
 
 - [x] Materialize `CLIENT` into Bronze
 - [x] Materialize `ACCOUNT` into Bronze
-- [ ] Materialize `PORTFOLIO` into Bronze
-- [ ] Materialize `SECURITY` into Bronze
+- [x] Materialize `PORTFOLIO` into Bronze
+- [x] Materialize `SECURITY` into Bronze
 - [ ] Materialize `HOLDINGS` into Bronze
 - [ ] Materialize `TRN_TRANSACTIONS` into Bronze
 - [ ] Decide full-load versus incremental strategy by table
@@ -179,8 +217,8 @@ Delta gives the Bronze layer a durable table abstraction suitable for repeatable
 - [ ] Add Bronze data-quality checks
 - [ ] Build Databricks Workflow orchestration
 
-The expected strategy is to treat small/reference-oriented tables such as `CLIENT`, `ACCOUNT`, `PORTFOLIO`, and `SECURITY` differently from larger changing datasets such as `HOLDINGS` and `TRN_TRANSACTIONS`, where incremental extraction should be demonstrated.
+The expected strategy is to treat `HOLDINGS` and `TRN_TRANSACTIONS` differently from the smaller reference-oriented datasets. Before creating those Bronze tables, the project will inspect their date/change columns and design the incremental extraction pattern deliberately.
 
-## 9. Important Connectivity Note
+## 13. Important Connectivity Note
 
 The current Oracle connection uses a temporary Pinggy TCP tunnel for development. The tunnel is not a production architecture and must remain active while the Oracle foreign catalog is queried. A production implementation would use private connectivity such as VPN or ExpressRoute between the Oracle environment and Azure/Databricks.
