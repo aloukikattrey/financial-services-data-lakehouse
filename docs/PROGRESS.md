@@ -18,7 +18,7 @@
 - [x] Initial design decisions documented
 - [x] Repository template directories created
 - [x] Oracle setup documentation added under `docs/oracle/ORACLE_SOURCE_SETUP.md`
-- [x] Oracle-to-Databricks connectivity documentation added under `docs/ORACLE_TO_DATABRICKS_SETUP.md`
+- [x] Oracle-to-Databricks connectivity documentation added under `docs/oracle/ORACLE_TO_DATABRICKS_SETUP.md`
 
 ### Azure / Databricks foundation
 - [x] Azure for Students subscription confirmed as the project subscription
@@ -72,25 +72,33 @@
 - [x] Databricks-to-tunnel TCP connectivity test succeeded
 - [x] Project schema `databricks-cata.finance` created
 - [x] Managed volume `databricks-cata.finance.jdbc_drivers` created successfully
+- [x] Oracle JDBC driver `ojdbc11.jar` uploaded to the managed volume
 - [x] Databricks metastore root storage credential issue diagnosed and fixed
 - [x] Existing `aloukik_creds` credential associated with the metastore root storage
+- [x] Databricks Oracle connection created
+- [x] Oracle foreign catalog `oracle_finance_source_catalog` created using service `FREEPDB1`
+- [x] Foreign catalog access configured for the project owner
+- [x] Oracle `FINANCE_APP` schema exposed through the foreign catalog
+- [x] Source tables visible in Databricks through Lakehouse Federation
+- [x] Source data successfully queried from Databricks
 
 ## In Progress
 
-- [ ] Upload Oracle JDBC driver `ojdbc11.jar` to `/Volumes/databricks-cata/finance/jdbc_drivers/`
-- [ ] Create the Databricks Oracle JDBC connection
-- [ ] Test Oracle authentication from Databricks
-- [ ] Query `FINANCE_APP.CLIENT` from Databricks
-- [ ] Validate JDBC access to all source tables
+- [ ] Validate JDBC/federation access across all source tables
+- [ ] Finalize source validation and row-count checks
+- [ ] Decide batch JDBC vs incremental extraction pattern
+- [ ] Document final source-table column definitions in `DATA_DICTIONARY.md`
+- [ ] Document source-table relationships in `DATA_MODEL.md`
 
 ## Upcoming
 
 ### Phase 2 — Oracle to Bronze
-- [ ] Implement JDBC extraction
+- [ ] Implement Oracle-to-Bronze ingestion
 - [ ] Create Bronze Delta tables
 - [ ] Add ingestion metadata
 - [ ] Implement incremental extraction strategy
 - [ ] Test repeatable loads
+- [ ] Add data-quality checks for Bronze ingestion
 
 ### Phase 3 — Silver
 - [ ] Clean transaction data
@@ -148,4 +156,4 @@ Azure Databricks workspace, Unity Catalog metastore, Access Connector, managed s
 A fresh Oracle Database Free Lite container was configured locally. The `FINANCE_APP` schema, financial tables, relationships, and synthetic source datasets were created. The detailed setup and SQL are recorded in `docs/oracle/ORACLE_SOURCE_SETUP.md`.
 
 ### Oracle-to-Databricks connectivity
-A temporary development tunnel was established between the local Oracle listener and Azure Databricks. TCP connectivity from the Databricks cluster was verified successfully. Unity Catalog managed-storage configuration was corrected by assigning `aloukik_creds` as the metastore root storage credential, after which the JDBC-driver managed volume was created successfully. The detailed connectivity setup is recorded in `docs/ORACLE_TO_DATABRICKS_SETUP.md`.
+A temporary development tunnel was established between the local Oracle listener and Azure Databricks. TCP connectivity from the Databricks cluster was verified successfully. Unity Catalog managed-storage configuration was corrected by assigning `aloukik_creds` as the metastore root storage credential, after which the JDBC-driver managed volume was created successfully. `ojdbc11.jar` was uploaded, the Oracle connection was created, and the Oracle foreign catalog was successfully created and queried. The detailed connectivity setup is recorded in `docs/oracle/ORACLE_TO_DATABRICKS_SETUP.md`.
