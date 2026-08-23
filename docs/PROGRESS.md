@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-**Phase 1 — Source Data Model / Oracle Source Complete**
+**Phase 2 — Oracle to Databricks Connectivity / Bronze Preparation**
 
 ## Completed
 
@@ -18,6 +18,7 @@
 - [x] Initial design decisions documented
 - [x] Repository template directories created
 - [x] Oracle setup documentation added under `docs/oracle/ORACLE_SOURCE_SETUP.md`
+- [x] Oracle-to-Databricks connectivity documentation added under `docs/ORACLE_TO_DATABRICKS_SETUP.md`
 
 ### Azure / Databricks foundation
 - [x] Azure for Students subscription confirmed as the project subscription
@@ -31,7 +32,11 @@
 - [x] Access Connector storage permissions configured for the metastore storage account
 - [x] Unity Catalog enabled on the workspace
 - [x] Unity Catalog catalog `databricks-cata` created
+- [x] Databricks storage credential `aloukik_creds` created
+- [x] `aloukik_creds` assigned as the metastore root storage credential
 - [x] Serverless Starter Warehouse available for SQL work
+- [x] Development all-purpose compute configured for Oracle connectivity testing
+- [x] Development compute set to DBR 17.3 LTS, single-node, Photon disabled, short auto-termination
 
 ### Local Oracle source foundation
 - [x] Docker Desktop installed and running
@@ -60,21 +65,27 @@
 - [x] Initial transaction financial-consistency validation performed
 - [x] Source-system relationships established through primary/foreign keys
 
+### Oracle → Databricks connectivity foundation
+- [x] Local Oracle port `1521` verified as reachable
+- [x] Temporary TCP development tunnel established from local Oracle to an Internet-accessible endpoint
+- [x] Databricks notebook created for connectivity testing
+- [x] Databricks-to-tunnel TCP connectivity test succeeded
+- [x] Project schema `databricks-cata.finance` created
+- [x] Managed volume `databricks-cata.finance.jdbc_drivers` created successfully
+- [x] Databricks metastore root storage credential issue diagnosed and fixed
+- [x] Existing `aloukik_creds` credential associated with the metastore root storage
+
 ## In Progress
 
-- [ ] Final validation of Oracle source data and counts
-- [ ] Validate transaction amount calculations and domain consistency
-- [ ] Validate holdings values and date coverage
-- [ ] Add/verify source indexes where needed
-- [ ] Document final source-table column definitions in `DATA_DICTIONARY.md`
-- [ ] Document source-table relationships in `DATA_MODEL.md`
+- [ ] Upload Oracle JDBC driver `ojdbc11.jar` to `/Volumes/databricks-cata/finance/jdbc_drivers/`
+- [ ] Create the Databricks Oracle JDBC connection
+- [ ] Test Oracle authentication from Databricks
+- [ ] Query `FINANCE_APP.CLIENT` from Databricks
+- [ ] Validate JDBC access to all source tables
 
 ## Upcoming
 
 ### Phase 2 — Oracle to Bronze
-- [ ] Establish network connectivity from Azure Databricks to the local Oracle source
-- [ ] Create Databricks Oracle connection
-- [ ] Test Oracle connectivity from Databricks
 - [ ] Implement JDBC extraction
 - [ ] Create Bronze Delta tables
 - [ ] Add ingestion metadata
@@ -133,8 +144,8 @@ Repository structure and project documentation created.
 ### Databricks foundation
 Azure Databricks workspace, Unity Catalog metastore, Access Connector, managed storage, and project catalog were configured.
 
-### Oracle source setup
-Docker Desktop was installed to host a local synthetic Oracle operational source without introducing an always-on Azure Oracle VM cost.
-
 ### Oracle source implementation
 A fresh Oracle Database Free Lite container was configured locally. The `FINANCE_APP` schema, financial tables, relationships, and synthetic source datasets were created. The detailed setup and SQL are recorded in `docs/oracle/ORACLE_SOURCE_SETUP.md`.
+
+### Oracle-to-Databricks connectivity
+A temporary development tunnel was established between the local Oracle listener and Azure Databricks. TCP connectivity from the Databricks cluster was verified successfully. Unity Catalog managed-storage configuration was corrected by assigning `aloukik_creds` as the metastore root storage credential, after which the JDBC-driver managed volume was created successfully. The detailed connectivity setup is recorded in `docs/ORACLE_TO_DATABRICKS_SETUP.md`.
