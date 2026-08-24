@@ -292,13 +292,267 @@ This test demonstrates several core data-engineering concepts rather than just c
 - **Idempotent reruns at the snapshot level** — a second run with no newer snapshot adds no rows.
 - **Source-specific design** — the ingestion strategy is based on how the source data behaves rather than applying one generic pattern to every table.
 
-## 12. Why `UPDATED_AT` Was Not Used
+## 12. Transaction Bronze: Source Redesign for Change-Aware Ingestion
 
-In a production system, `UPDATED_AT` would often be a strong candidate for incremental extraction. In the current synthetic source, however, `UPDATED_AT` is identical across all generated holdings records, so it cannot reliably distinguish newly changed records.
+The original synthetic `TRN_TRANSACTIONS` table did not contain `CREATED_AT` or `UPDATED_AT`. That would have forced the project to rely on `TRANSACTION_DATE`, which can represent business event time but is not a reliable indicator that a source record was newly inserted or changed.
 
-Rather than manufacturing a false change-data-capture story, the project uses the source's actual snapshot behavior and explicitly documents the assumption behind `AS_OF_DATE` watermarking.
+Because this project is intended to model a realistic operational source, the transaction table was deliberately recreated with explicit technical timestamps:
 
-## 13. Ingestion Metadata and Operational Context
+```text
+TRANSACTION_ID
+PORTFOLIO_ID
+SECURITY_ID
+TRANSACTION_DATE
+SETTLEMENT_DATE
+TRANSACTION_TYPE
+BUY_SELL_FLAG
+QUANTITY
+PRICE
+GROSS_AMOUNT
+FEES
+NET_AMOUNT
+CURRENCY_CODE
+TRADE_STATUS
+SOURCE_REFERENCE
+CREATED_AT
+UPDATED_AT
+```
+
+The table was regenerated with 5,000 synthetic transactions. `TRANSACTION_ID` is unique and serves as the merge/business key for the Bronze Delta table.
+
+### Why this redesign matters
+
+`TRANSACTION_DATE` and `UPDATED_AT` represent different concepts:
+
+```text
+TRANSACTION_DATE
+→ when the financial event occurred
+
+UPDATED_AT
+→ when the operational source record was last changed
+```
+
+Using `TRANSACTION_DATE` as a change watermark could miss late-arriving records or corrections to older transactions. `UPDATED_AT` is therefore a better technical watermark for a mutable transaction source, provided the source system maintains it reliably.
+
+This is intentionally different from `HOLDINGS`, where the source is modeled as immutable periodic snapshots and `AS_OF_DATE` is the appropriate extraction boundary.
+
+## 13. Initial Transaction Bronze Load
+
+The recreated `TRN_TRANSACTIONS` source was exposed through the foreign catalog and validated from Databricks:
+
+- 5,000 source rows
+- `TRANSACTION_ID` values 1 through 5,000
+- `TRANSACTION_ID` unique
+- `CREATED_AT` and `UPDATED_AT` available for change detection
+
+The initial Bronze materialization was:
+
+```sql
+CREATE TABLE `databricks-cata`.bronze.trn_transactions
+USING DELTA
+AS
+SELECT
+    *,
+    current_timestamp() AS ingestion_timestamp,
+    'ORACLE' AS source_system,
+    'FINANCE_APP.TRN_TRANSACTIONS' AS source_table
+FROM oracle_finance_source_catalog.finance_app.TRN_TRANSACTIONS;
+```
+
+The resulting Bronze row count was 5,000.
+
+The initial incremental watermark was established using:
+
+```sql
+SELECT
+    MAX(UPDATED_AT) AS last_loaded_updated_at
+FROM `databricks-cata`.bronze.trn_transactions;
+```
+
+The captured baseline watermark for the test was:
+
+```text
+2026-08-17 11:00:00 UTC
+```
+
+## 14. Transaction Incremental Load Test
+
+The source was then changed in two ways to test both sides of the incremental pattern:
+
+1. A new transaction (`TRANSACTION_ID = 5001`) was inserted.
+2. An existing transaction (`TRANSACTION_ID = 100`) was updated and its `UPDATED_AT` timestamp advanced.
+
+Both records had `UPDATED_AT` later than the Bronze watermark.
+
+The extraction query was implemented using Spark SQL:
+
+```sql
+%sql
+
+SELECT
+    TRANSACTION_ID,
+    TRADE_STATUS,
+    UPDATED_AT
+FROM oracle_finance_source_catalog.finance_app.TRN_TRANSACTIONS
+WHERE UPDATED_AT >
+      (
+          SELECT MAX(UPDATED_AT)
+          FROM `databricks-cata`.bronze.trn_transactions
+      )
+ORDER BY TRANSACTION_ID;
+```
+
+The changed set contained the expected existing and new transactions.
+
+### Delta MERGE design
+
+The changed source rows were merged into Bronze using `TRANSACTION_ID` as the match key:
+
+```sql
+%sql
+
+MERGE INTO `databricks-cata`.bronze.trn_transactions AS target
+USING (
+    SELECT
+        *,
+        current_timestamp() AS ingestion_timestamp,
+        'ORACLE' AS source_system,
+        'FINANCE_APP.TRN_TRANSACTIONS' AS source_table
+    FROM oracle_finance_source_catalog.finance_app.TRN_TRANSACTIONS
+    WHERE UPDATED_AT >
+          (
+              SELECT MAX(UPDATED_AT)
+              FROM `databricks-cata`.bronze.trn_transactions
+          )
+) AS source
+ON target.TRANSACTION_ID = source.TRANSACTION_ID
+
+WHEN MATCHED THEN UPDATE SET
+    target.PORTFOLIO_ID = source.PORTFOLIO_ID,
+    target.SECURITY_ID = source.SECURITY_ID,
+    target.TRANSACTION_DATE = source.TRANSACTION_DATE,
+    target.SETTLEMENT_DATE = source.SETTLEMENT_DATE,
+    target.TRANSACTION_TYPE = source.TRANSACTION_TYPE,
+    target.BUY_SELL_FLAG = source.BUY_SELL_FLAG,
+    target.QUANTITY = source.QUANTITY,
+    target.PRICE = source.PRICE,
+    target.GROSS_AMOUNT = source.GROSS_AMOUNT,
+    target.FEES = source.FEES,
+    target.NET_AMOUNT = source.NET_AMOUNT,
+    target.CURRENCY_CODE = source.CURRENCY_CODE,
+    target.TRADE_STATUS = source.TRADE_STATUS,
+    target.SOURCE_REFERENCE = source.SOURCE_REFERENCE,
+    target.CREATED_AT = source.CREATED_AT,
+    target.UPDATED_AT = source.UPDATED_AT,
+    target.ingestion_timestamp = source.ingestion_timestamp
+
+WHEN NOT MATCHED THEN INSERT (
+    TRANSACTION_ID,
+    PORTFOLIO_ID,
+    SECURITY_ID,
+    TRANSACTION_DATE,
+    SETTLEMENT_DATE,
+    TRANSACTION_TYPE,
+    BUY_SELL_FLAG,
+    QUANTITY,
+    PRICE,
+    GROSS_AMOUNT,
+    FEES,
+    NET_AMOUNT,
+    CURRENCY_CODE,
+    TRADE_STATUS,
+    SOURCE_REFERENCE,
+    CREATED_AT,
+    UPDATED_AT,
+    ingestion_timestamp,
+    source_system,
+    source_table
+)
+VALUES (
+    source.TRANSACTION_ID,
+    source.PORTFOLIO_ID,
+    source.SECURITY_ID,
+    source.TRANSACTION_DATE,
+    source.SETTLEMENT_DATE,
+    source.TRANSACTION_TYPE,
+    source.BUY_SELL_FLAG,
+    source.QUANTITY,
+    source.PRICE,
+    source.GROSS_AMOUNT,
+    source.FEES,
+    source.NET_AMOUNT,
+    source.CURRENCY_CODE,
+    source.TRADE_STATUS,
+    source.SOURCE_REFERENCE,
+    source.CREATED_AT,
+    source.UPDATED_AT,
+    source.ingestion_timestamp,
+    source.source_system,
+    source.source_table
+);
+```
+
+### Result
+
+The merge produced the intended behavior:
+
+```text
+TRANSACTION_ID 100
+→ existing Bronze row updated
+
+TRANSACTION_ID 5001
+→ new Bronze row inserted
+```
+
+The Bronze table moved from 5,000 to 5,001 rows, confirming that the updated existing transaction was not duplicated while the new transaction was added.
+
+A follow-up watermark check returned no records newer than the new Bronze watermark, demonstrating that a subsequent incremental extraction has no additional rows to process.
+
+### Why `MERGE` is appropriate here
+
+This is a mutable event-source pattern:
+
+```text
+Oracle
+   │
+   │ UPDATED_AT > watermark
+   ▼
+New / changed transactions
+   │
+   ▼
+Delta MERGE
+   ├── matching TRANSACTION_ID → UPDATE
+   └── new TRANSACTION_ID      → INSERT
+```
+
+The project therefore demonstrates two different incremental ingestion patterns:
+
+```text
+HOLDINGS
+→ immutable snapshots
+→ AS_OF_DATE watermark
+→ append
+
+TRN_TRANSACTIONS
+→ mutable event records
+→ UPDATED_AT watermark
+→ MERGE by TRANSACTION_ID
+```
+
+This distinction is intentional. It reflects a core data-engineering principle: ingestion logic should follow the source's change semantics rather than forcing every table into one template.
+
+## 15. Why `UPDATED_AT` Is a Better Transaction Watermark
+
+`TRANSACTION_DATE` represents event/business time. A transaction can occur on one date and be corrected later. A reliable `UPDATED_AT` provides technical change-detection time and therefore makes it possible to capture:
+
+- newly inserted transactions
+- modified statuses
+- corrected financial attributes
+- other source-record changes
+
+In production, the reliability of this column should be validated against the source system's update semantics. If late-arriving records, clock skew, timestamp precision, or unreliable source timestamps exist, a lookback window, source CDC, or another reconciliation mechanism may be required.
+
+## 16. Ingestion Metadata and Operational Context
 
 The Bronze tables retain source-level columns and add technical metadata:
 
@@ -308,27 +562,17 @@ The Bronze tables retain source-level columns and add technical metadata:
 
 These fields are intentionally technical rather than business attributes. They create a basic audit trail and make troubleshooting easier without moving business transformations into Bronze.
 
-## 14. Validation
+## 17. Validation
 
-Row counts were compared between the foreign Oracle source and the Bronze tables.
+Row counts were compared between the foreign Oracle source and Bronze tables.
 
-For example:
+For reference tables, source and Bronze counts were compared after initial full loads.
 
-```sql
-SELECT COUNT(*)
-FROM oracle_finance_source_catalog.finance_app.account;
-```
+For `HOLDINGS`, snapshot counts, the watermark, the new snapshot, and second-run no-new-data behavior were validated.
 
-```sql
-SELECT COUNT(*)
-FROM `databricks-cata`.bronze.account;
-```
+For `TRN_TRANSACTIONS`, the unique transaction ID range, the initial watermark, the new transaction, the updated transaction, the Delta `MERGE`, and the post-merge row count were validated.
 
-For holdings, snapshot counts and the incremental watermark were validated before and after ingestion.
-
-The Bronze data was verified successfully for the completed tables and the incremental `HOLDINGS` test.
-
-## 15. Design Decisions
+## 18. Design Decisions
 
 ### Preserve source-level data in Bronze
 
@@ -344,26 +588,29 @@ Delta gives the Bronze layer a durable table abstraction suitable for repeatable
 
 ### Different tables can use different ingestion strategies
 
-Small reference-oriented tables can start with full snapshots, while larger operational datasets can use incremental extraction. The project demonstrates both patterns rather than forcing every source table into the same ingestion design.
+Small reference-oriented tables can start with full snapshots, `HOLDINGS` uses immutable snapshot ingestion, and `TRN_TRANSACTIONS` uses change-aware ingestion with `UPDATED_AT` and Delta `MERGE`.
 
 ### Document source assumptions explicitly
 
-For `HOLDINGS`, `AS_OF_DATE` watermarking is valid only under the assumption that completed snapshots are immutable. If the production source permits historical corrections, the ingestion design must change to detect and reconcile those changes.
+For `HOLDINGS`, `AS_OF_DATE` watermarking is valid only under the assumption that completed snapshots are immutable. For `TRN_TRANSACTIONS`, `UPDATED_AT` is treated as reliable source change-detection time for this project; a production implementation should verify the source's timestamp semantics and consider CDC/reconciliation where needed.
 
-## 16. Current Progress
+## 19. Current Progress
 
 ```text
-CLIENT              ✓ Bronze full load
-ACCOUNT             ✓ Bronze full load
-PORTFOLIO           ✓ Bronze full load
-SECURITY            ✓ Bronze full load
-HOLDINGS            ✓ Bronze initial load
+CLIENT               ✓ Bronze full load
+ACCOUNT              ✓ Bronze full load
+PORTFOLIO            ✓ Bronze full load
+SECURITY             ✓ Bronze full load
+HOLDINGS             ✓ Bronze initial load
 HOLDINGS incremental ✓ New snapshot detected and appended
-                      ✓ Second-run no-new-data test passed
-TRN_TRANSACTIONS    pending
+                       ✓ Second-run no-new-data test passed
+TRN_TRANSACTIONS     ✓ Source redesigned with CREATED_AT / UPDATED_AT
+TRN_TRANSACTIONS     ✓ Bronze initial load
+TRN_TRANSACTIONS     ✓ New transaction + update test
+TRN_TRANSACTIONS     ✓ Delta MERGE validated
 ```
 
-## 17. Next Work
+## 20. Next Work
 
 - [x] Materialize `CLIENT` into Bronze
 - [x] Materialize `ACCOUNT` into Bronze
@@ -373,13 +620,16 @@ TRN_TRANSACTIONS    pending
 - [x] Validate `HOLDINGS` incremental watermark
 - [x] Test new-snapshot ingestion
 - [x] Test second-run/no-duplicate behavior
-- [ ] Inspect `TRN_TRANSACTIONS` source change columns
-- [ ] Design transaction-specific incremental ingestion
-- [ ] Materialize `TRN_TRANSACTIONS` into Bronze
+- [x] Inspect `TRN_TRANSACTIONS` source change columns
+- [x] Design transaction-specific incremental ingestion
+- [x] Materialize `TRN_TRANSACTIONS` into Bronze
+- [x] Add and validate `UPDATED_AT` watermarking
+- [x] Validate Delta `MERGE` for updates and inserts
 - [ ] Add deterministic ingestion/load identifiers where required
 - [ ] Add Bronze data-quality checks
 - [ ] Build Databricks Workflow orchestration
+- [ ] Design Silver layer transformations
 
-## 18. Important Connectivity Note
+## 21. Important Connectivity Note
 
 The current Oracle connection uses a temporary Pinggy TCP tunnel for development. The tunnel is not a production architecture and must remain active while the Oracle foreign catalog is queried. A production implementation would use private connectivity such as VPN or ExpressRoute between the Oracle environment and Azure/Databricks.
