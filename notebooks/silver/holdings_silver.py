@@ -9,19 +9,20 @@
 # MAGIC - Calculate portfolio-level exposure using a window function.
 # MAGIC - Derive business classifications and reporting attributes.
 # MAGIC - Persist the transformed dataset as a Delta Silver table.
+# MAGIC - Build a current-position view from historical snapshots without deleting history.
 # MAGIC
 # MAGIC **Architecture**
 # MAGIC
-# MAGIC `Oracle → Foreign Catalog → Bronze Delta → PySpark transformations → Silver Delta`
+# MAGIC `Oracle → Foreign Catalog → Bronze Delta → PySpark transformations → Silver Delta → Current Positions`
 # MAGIC
-# MAGIC **Design note:** `HOLDINGS` is modeled as periodic point-in-time snapshots. Historical snapshots are retained; the Silver transformation does not collapse the table to only the latest date.
+# MAGIC **Design note:** `HOLDINGS` is modeled as periodic point-in-time snapshots. Historical snapshots are retained; the Silver history table does not collapse the data to only the latest date.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 1. Imports and source table
 # MAGIC
-# MAGIC PySpark is used as the primary transformation framework. Spark SQL can still be used for ad-hoc validation, but the transformation logic is intentionally expressed with the DataFrame API.
+# MAGIC PySpark is the primary transformation framework. Spark SQL remains available for ad-hoc validation, but transformation logic is expressed with the DataFrame API.
 
 # COMMAND ----------
 
@@ -30,6 +31,7 @@ from pyspark.sql.window import Window
 
 SOURCE_TABLE = "`databricks-cata`.bronze.holdings"
 TARGET_TABLE = "`databricks-cata`.silver.holdings"
+CURRENT_TARGET_TABLE = "`databricks-cata`.silver.current_holdings"
 
 holdings_df = spark.table(SOURCE_TABLE)
 
@@ -40,13 +42,7 @@ display(holdings_df.limit(10))
 # MAGIC %md
 # MAGIC ## 2. Source quality baseline
 # MAGIC
-# MAGIC The Bronze source currently contains the controlled holdings snapshots used for the project. Before transformation, establish the row count and check the expected position key.
-# MAGIC
-# MAGIC For this project the logical position grain is:
-# MAGIC
-# MAGIC **`PORTFOLIO_ID + SECURITY_ID + AS_OF_DATE`**
-# MAGIC
-# MAGIC `HOLDING_ID` remains the source identifier.
+# MAGIC The expected position grain is `PORTFOLIO_ID + SECURITY_ID + AS_OF_DATE`. `HOLDING_ID` remains the source identifier.
 
 # COMMAND ----------
 
@@ -67,9 +63,9 @@ display(position_key_duplicates)
 # MAGIC %md
 # MAGIC ## 3. Deduplicate the position grain
 # MAGIC
-# MAGIC A financial source can deliver multiple versions of the same position for the same portfolio, security, and valuation date. Silver keeps the most recently updated version.
+# MAGIC A source can deliver multiple versions of the same position for the same portfolio, security, and valuation date. Silver retains the most recently updated version.
 # MAGIC
-# MAGIC `row_number()` is used as the window function so the rule is deterministic when duplicates exist.
+# MAGIC `row_number()` makes the selection deterministic when duplicates exist.
 
 # COMMAND ----------
 
@@ -97,7 +93,7 @@ print(f"Rows after deduplication: {holdings_deduped.count()}")
 # MAGIC %md
 # MAGIC ## 4. Financial calculations
 # MAGIC
-# MAGIC `MARKET_VALUE` and `COST_BASIS` are treated as source valuation fields. We derive:
+# MAGIC `MARKET_VALUE` and `COST_BASIS` are treated as source valuation fields.
 # MAGIC
 # MAGIC - **UNREALIZED_PNL** = `MARKET_VALUE - COST_BASIS`
 # MAGIC - **UNREALIZED_PNL_PCT** = `(MARKET_VALUE - COST_BASIS) / COST_BASIS × 100`
@@ -129,9 +125,7 @@ holdings_transformed = (
 # MAGIC %md
 # MAGIC ## 5. Portfolio-level window calculations
 # MAGIC
-# MAGIC The same Silver row can carry both position-level and portfolio-level context.
-# MAGIC
-# MAGIC The partition is `PORTFOLIO_ID + AS_OF_DATE`, so every holding is compared with the total value of its portfolio on the same snapshot date.
+# MAGIC The partition is `PORTFOLIO_ID + AS_OF_DATE`, so each position is compared with its portfolio's total market value for the same snapshot.
 # MAGIC
 # MAGIC **PORTFOLIO_ALLOCATION_PCT** = position `MARKET_VALUE` / portfolio total `MARKET_VALUE` × 100
 
@@ -162,7 +156,7 @@ holdings_transformed = (
 # MAGIC %md
 # MAGIC ## 6. Business classifications and reporting attributes
 # MAGIC
-# MAGIC Convert the numeric P&L into a business-friendly classification and derive calendar attributes used by downstream reporting.
+# MAGIC Convert numeric P&L into a business-friendly classification and derive calendar attributes used by downstream reporting.
 
 # COMMAND ----------
 
@@ -183,7 +177,7 @@ holdings_transformed = (
 # MAGIC %md
 # MAGIC ## 7. Silver data-quality classification
 # MAGIC
-# MAGIC Silver identifies basic valuation/relationship issues without silently discarding records. This allows downstream consumers or a future quarantine process to decide how invalid records should be handled.
+# MAGIC Silver identifies basic valuation and relationship issues without silently discarding records. A future quarantine layer can isolate invalid rows when required.
 
 # COMMAND ----------
 
@@ -226,9 +220,9 @@ display(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Persist the Silver Delta table
+# MAGIC ## 9. Persist the historical Silver Delta table
 # MAGIC
-# MAGIC The initial implementation uses overwrite to create the target table. This is intentionally an initial-build pattern; later incremental Silver processing should use a controlled Delta upsert/merge design.
+# MAGIC This initial implementation uses overwrite to create the target table. Later incremental Silver processing can use a controlled Delta upsert/merge pattern.
 
 # COMMAND ----------
 
@@ -243,9 +237,7 @@ display(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 10. Validation
-# MAGIC
-# MAGIC Validate row preservation, portfolio allocation, P&L calculation, and the business classification.
+# MAGIC ## 10. Validate the historical Silver table
 
 # COMMAND ----------
 
@@ -295,15 +287,108 @@ display(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 11. Outcome
+# MAGIC ## 11. Build current holdings from historical snapshots
 # MAGIC
-# MAGIC The Silver `HOLDINGS` transformation now demonstrates hands-on data-engineering logic rather than source copying:
+# MAGIC The historical Silver table retains every completed snapshot. For operational reporting, we often also need the latest known position per `PORTFOLIO_ID + SECURITY_ID`.
+# MAGIC
+# MAGIC We derive this as a separate dataset rather than deleting historical records.
+# MAGIC
+# MAGIC **Historical grain:** `PORTFOLIO_ID + SECURITY_ID + AS_OF_DATE`
+# MAGIC
+# MAGIC **Current-position grain:** `PORTFOLIO_ID + SECURITY_ID`
+
+# COMMAND ----------
+
+current_position_window = (
+    Window
+    .partitionBy("PORTFOLIO_ID", "SECURITY_ID")
+    .orderBy(
+        F.col("AS_OF_DATE").desc(),
+        F.col("UPDATED_AT").desc_nulls_last(),
+        F.col("HOLDING_ID").desc()
+    )
+)
+
+current_holdings_df = (
+    silver_holdings_df
+    .withColumn("_row_number", F.row_number().over(current_position_window))
+    .filter(F.col("_row_number") == 1)
+    .drop("_row_number")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 12. Validate current-position grain
+
+# COMMAND ----------
+
+duplicate_current_positions = (
+    current_holdings_df
+    .groupBy("PORTFOLIO_ID", "SECURITY_ID")
+    .count()
+    .filter(F.col("count") > 1)
+)
+
+display(duplicate_current_positions)
+
+print(f"Historical Silver rows: {silver_holdings_df.count()}")
+print(f"Current Holdings rows: {current_holdings_df.count()}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 13. Review current holdings
+
+# COMMAND ----------
+
+display(
+    current_holdings_df.select(
+        "HOLDING_ID",
+        "PORTFOLIO_ID",
+        "SECURITY_ID",
+        "AS_OF_DATE",
+        "QUANTITY",
+        "MARKET_VALUE",
+        "COST_BASIS",
+        "UNREALIZED_PNL",
+        "UNREALIZED_PNL_PCT",
+        "PORTFOLIO_ALLOCATION_PCT",
+        "POSITION_PERFORMANCE",
+        "DATA_QUALITY_STATUS"
+    ).orderBy("PORTFOLIO_ID", "SECURITY_ID")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 14. Persist current holdings
+# MAGIC
+# MAGIC `current_holdings` is a convenience Silver dataset for downstream portfolio analytics. It does not replace the historical Silver holdings table.
+
+# COMMAND ----------
+
+(
+    current_holdings_df
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .saveAsTable(CURRENT_TARGET_TABLE)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 15. Outcome
+# MAGIC
+# MAGIC The Holdings Silver layer now demonstrates substantive financial data-engineering logic:
 # MAGIC
 # MAGIC - Window-based deduplication
 # MAGIC - Financial measure derivation
 # MAGIC - Portfolio-level window aggregation
-# MAGIC - Business classification
+# MAGIC - Business performance classification
 # MAGIC - Data-quality classification
+# MAGIC - Historical snapshot preservation
+# MAGIC - Latest-position derivation using a second window function
+# MAGIC - Separate historical and current business grains
 # MAGIC - Delta persistence and validation
-# MAGIC
-# MAGIC Historical `AS_OF_DATE` snapshots remain available in Silver. A separate current-position transformation can be built downstream without losing the historical record.
